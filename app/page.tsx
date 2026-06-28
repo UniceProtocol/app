@@ -144,10 +144,97 @@ export default function Dashboard() {
     }
   };
 
-  // Initialize data using fallback JsonRpcProvider if MetaMask not available
+  // Indexer API URL
+  const INDEXER_API_URL = process.env.NEXT_PUBLIC_INDEXER_API || "http://localhost:8080";
+
+  // Initialize data — tries indexer API first, falls back to direct RPC
   const loadMarketsData = useCallback(async (userAddress?: string) => {
     try {
-      // Create static provider to fetch data permissionlessly (extremely robust)
+      // --- Attempt 1: Fetch base market data from Indexer API ---
+      let apiMarkets: Market[] | null = null;
+      try {
+        const res = await fetch(`${INDEXER_API_URL}/api/markets`, {
+          signal: AbortSignal.timeout(5000),
+        });
+        if (res.ok) {
+          const json = await res.json();
+          if (json.success && Array.isArray(json.data) && json.data.length > 0) {
+            apiMarkets = json.data.map((m: any) => {
+              // Convert wei pool amounts to human-readable
+              const yesPoolWei = BigInt(m.total_yes_pool || "0");
+              const noPoolWei = BigInt(m.total_no_pool || "0");
+              return {
+                address: m.address,
+                question: m.question,
+                category: m.category,
+                bettingDeadline: Number(m.betting_deadline),
+                resolutionDeadline: Number(m.resolution_deadline),
+                totalYesPool: ethers.formatUnits(yesPoolWei, 18),
+                totalNoPool: ethers.formatUnits(noPoolWei, 18),
+                outcome: m.outcome,
+                finalized: m.status === "FINALIZED",
+                status: m.status,
+                yesOdds: m.yes_odds,
+                noOdds: m.no_odds,
+                challenged: false,
+                submittedAt: 0,
+                userYesShares: "0.00",
+                userNoShares: "0.00",
+                userClaimed: false,
+                claimable: "0.00",
+              };
+            });
+            console.log(`[Unice] Loaded ${apiMarkets!.length} markets from indexer API`);
+          }
+        }
+      } catch (apiErr) {
+        console.warn("[Unice] Indexer API unavailable, falling back to RPC:", apiErr);
+      }
+
+      // --- Enrich with on-chain data (challenged, submittedAt, user-specific) ---
+      if (apiMarkets && apiMarkets.length > 0) {
+        const rpcProvider = new ethers.JsonRpcProvider(RPC_URL);
+        const enriched = await Promise.all(
+          apiMarkets.map(async (market) => {
+            try {
+              const marketContract = new ethers.Contract(market.address, UNICE_PREDICTION_MARKET_ABI, rpcProvider);
+
+              // Fetch on-chain fields not tracked by indexer
+              const [challenged, submittedAt, odds] = await Promise.all([
+                marketContract.challenged(),
+                marketContract.submittedAt(),
+                marketContract.getOdds(),
+              ]);
+              market.challenged = challenged;
+              market.submittedAt = Number(submittedAt);
+              market.yesOdds = Number(odds[0]) / 100;
+              market.noOdds = Number(odds[1]) / 100;
+
+              // Fetch user-specific data if wallet is connected
+              if (userAddress) {
+                const [yesShares, noShares, claimed, claimable] = await Promise.all([
+                  marketContract.yesShares(userAddress),
+                  marketContract.noShares(userAddress),
+                  marketContract.claimed(userAddress),
+                  marketContract.getClaimable(userAddress),
+                ]);
+                market.userYesShares = ethers.formatUnits(yesShares, 18);
+                market.userNoShares = ethers.formatUnits(noShares, 18);
+                market.userClaimed = claimed;
+                market.claimable = ethers.formatUnits(claimable, 18);
+              }
+            } catch (e) {
+              console.warn(`[Unice] RPC enrichment failed for ${market.address}:`, e);
+            }
+            return market;
+          })
+        );
+        setMarkets(enriched);
+        return;
+      }
+
+      // --- Attempt 2: Full RPC fallback (original logic) ---
+      console.log("[Unice] Loading markets via direct RPC...");
       const rpcProvider = new ethers.JsonRpcProvider(RPC_URL);
       const factoryContract = new ethers.Contract(UNICE_FACTORY_ADDRESS, UNICE_FACTORY_ABI, rpcProvider);
 
@@ -692,9 +779,6 @@ export default function Dashboard() {
             <h1 className="text-xl font-bold tracking-wider text-white">
               UNICE
             </h1>
-            <span className="text-[10px] uppercase font-bold text-zinc-400 tracking-widest block">
-              Prediction Market
-            </span>
           </div>
         </div>
 
@@ -852,9 +936,6 @@ export default function Dashboard() {
               <Trophy className="w-64 h-64 text-zinc-400" />
             </div>
             <div className="relative z-10 flex flex-col items-start gap-2.5 max-w-lg">
-              <span className="bg-zinc-800 border border-zinc-700 text-zinc-200 text-[10px] font-bold tracking-widest uppercase px-3 py-1 rounded-full">
-                Arbitrum Sepolia Testnet
-              </span>
               <h2 className="text-2xl md:text-3xl font-extrabold text-white leading-tight">
                 Prediction Markets on Unice
               </h2>
